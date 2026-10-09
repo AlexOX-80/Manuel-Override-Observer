@@ -21,25 +21,30 @@ class ManualOverrideManager extends IPSModule
         $this->RegisterVariableString('Status', 'Status');
         $this->RegisterVariableString('DeviceStates', 'Gerätestatus JSON');
         $this->RegisterVariableString('LastEvent', 'Letztes Ereignis');
+
         $this->RegisterTimer('RefreshDebugTimer', 0, 'MOM_RefreshDebug($_IPS["TARGET"]);');
         $this->RegisterTimer('ExpireTimer', 0, 'MOM_ExpireOverrides($_IPS["TARGET"]);');
+        $this->RegisterTimer('TreeSyncTimer', 0, 'MOM_SyncVisibleDeviceTree($_IPS["TARGET"]);');
     }
 
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        $old = $this->ReadAttributeInteger('RegisteredGatewayID');
-        if ($old > 0 && IPS_InstanceExists($old)) {
-            @$this->UnregisterMessage($old, KL_DEBUG);
+
+        $oldGateway = $this->ReadAttributeInteger('RegisteredGatewayID');
+        if ($oldGateway > 0 && IPS_InstanceExists($oldGateway)) {
+            @$this->UnregisterMessage($oldGateway, KL_DEBUG);
         }
         $this->WriteAttributeInteger('RegisteredGatewayID', 0);
 
+        $this->SetTimerInterval('RefreshDebugTimer', 0);
+        $this->SetTimerInterval('ExpireTimer', 0);
+        $this->SetTimerInterval('TreeSyncTimer', 0);
+
         if (!$this->ReadPropertyBoolean('Active')) {
-            $this->SetTimerInterval('RefreshDebugTimer', 0);
-            $this->SetTimerInterval('ExpireTimer', 0);
             $this->setStatusText('deaktiviert');
             $this->SetStatus(104);
-            $this->renderStates();
+            $this->renderStateValues();
             return;
         }
 
@@ -51,14 +56,13 @@ class ManualOverrideManager extends IPSModule
             $this->RefreshDebug();
             $this->SetStatus(102);
         } else {
-            $this->SetTimerInterval('RefreshDebugTimer', 0);
             $this->setStatusText('aktiv · kein KNX-Gateway gefunden · Symcon-UI-Erkennung weiterhin nutzbar');
             $this->SetStatus(201);
         }
 
         $this->SetTimerInterval('ExpireTimer', 60000);
-        $this->ExpireOverrides();
-        $this->renderStates();
+        $this->SetTimerInterval('TreeSyncTimer', 3000);
+        $this->renderStateValues();
     }
 
     public function RefreshDebug(): void
@@ -84,21 +88,19 @@ class ManualOverrideManager extends IPSModule
         }
 
         $text = $this->flattenDebugData($Data);
-        if ($text === '') {
-            return;
-        }
-        if (!preg_match_all('~\\b(\\d{1,2}/\\d{1,2}/\\d{1,3})\\s*\\((\\d{1,2}\\.\\d{1,2}\\.\\d{1,3})\\)~', $text, $matches, PREG_SET_ORDER)) {
+        if ($text === '' || !preg_match_all('~\b(\d{1,2}/\d{1,2}/\d{1,3})\s*\((\d{1,2}\.\d{1,2}\.\d{1,3})\)~', $text, $matches, PREG_SET_ORDER)) {
             return;
         }
 
         $gaMap = $this->groupAddressMap();
+        $symconAddress = trim($this->ReadPropertyString('SymconSourceAddress'));
+
         foreach ($matches as $match) {
             $ga = $match[1];
             if (!isset($gaMap[$ga])) {
                 continue;
             }
             $sourceAddress = $match[2];
-            $symconAddress = trim($this->ReadPropertyString('SymconSourceAddress'));
             $source = ($symconAddress !== '' && $sourceAddress === $symconAddress) ? 'SYMCON_OUT' : 'KNX_DEVICE';
 
             foreach ($gaMap[$ga] as $deviceKey) {
@@ -127,32 +129,57 @@ class ManualOverrideManager extends IPSModule
         if ($deviceKey === '') {
             return false;
         }
+
         $groups = json_decode($groupAddressesJson, true);
         if (!is_array($groups)) {
             $groups = [];
         }
-        $groups = array_values(array_unique(array_filter(array_map('strval', $groups), fn($x) => preg_match('~^\\d{1,2}/\\d{1,2}/\\d{1,3}$~', $x))));
+        $groups = array_values(array_unique(array_filter(
+            array_map('strval', $groups),
+            fn($x) => preg_match('~^\d{1,2}/\d{1,2}/\d{1,3}$~', $x) === 1
+        )));
+        sort($groups);
 
-        $devices = $this->dynamicDevices();
-        $devices[$deviceKey] = [
+        $new = [
             'key' => $deviceKey,
             'name' => $name !== '' ? $name : $deviceKey,
             'groupAddresses' => $groups,
             'actionVariableID' => max(0, $actionVariableID),
             'overrideMinutes' => max(0, $overrideMinutes)
         ];
+
+        $devices = $this->dynamicDevices();
+        $old = $devices[$deviceKey] ?? null;
+        if ($old === $new) {
+            return true;
+        }
+
+        $devices[$deviceKey] = $new;
         $this->WriteAttributeString('DynamicDevices', json_encode($devices, JSON_UNESCAPED_UNICODE));
-        $this->renderStates();
+
+        // Object creation is deliberately deferred. SmartShading may call this method
+        // for many devices in one evaluation; creating the visible tree here caused
+        // repeated full-tree work and could overload IP-Symcon during module updates.
+        $this->SetTimerInterval('TreeSyncTimer', 1500);
         return true;
     }
 
     public function UnregisterDevice(string $deviceKey): void
     {
         $devices = $this->dynamicDevices();
+        if (!isset($devices[$deviceKey])) {
+            return;
+        }
         unset($devices[$deviceKey]);
         $this->WriteAttributeString('DynamicDevices', json_encode($devices, JSON_UNESCAPED_UNICODE));
-        $this->ClearOverride($deviceKey, 'UNREGISTERED');
-        $this->renderStates();
+
+        $states = $this->states();
+        if (isset($states[$deviceKey])) {
+            unset($states[$deviceKey]);
+            $this->WriteAttributeString('OverrideStates', json_encode($states, JSON_UNESCAPED_UNICODE));
+        }
+        $this->SetTimerInterval('TreeSyncTimer', 1500);
+        $this->renderStateValues();
     }
 
     public function NotifyAction(int $variableID, string $sender, string $valueJson = 'null'): bool
@@ -165,8 +192,7 @@ class ManualOverrideManager extends IPSModule
             return false;
         }
 
-        $manualSenders = ['WebFront', 'WebInterface', 'WebHook', 'WebOAuth'];
-        $manual = in_array($sender, $manualSenders, true);
+        $manual = in_array($sender, ['WebFront', 'WebInterface', 'WebHook', 'WebOAuth'], true);
         $source = $manual ? 'SYMCON_UI' : 'SYMCON_AUTOMATION';
         $value = json_decode($valueJson, true);
 
@@ -204,9 +230,9 @@ class ManualOverrideManager extends IPSModule
     {
         $states = $this->states();
         if (!isset($states[$deviceKey])) {
-            $this->renderStates();
             return;
         }
+
         $old = $states[$deviceKey];
         unset($states[$deviceKey]);
         $this->WriteAttributeString('OverrideStates', json_encode($states, JSON_UNESCAPED_UNICODE));
@@ -219,32 +245,82 @@ class ManualOverrideManager extends IPSModule
             'reason' => $reason,
             'previousSource' => $old['source'] ?? null
         ]);
-        $this->renderStates();
+        $this->renderStateValues();
     }
 
     public function ClearAllOverrides(string $reason = 'CLEARED_ALL'): void
     {
-        foreach (array_keys($this->states()) as $deviceKey) {
-            $this->ClearOverride((string)$deviceKey, $reason);
+        $states = $this->states();
+        if ($states === []) {
+            return;
         }
-        $this->renderStates();
+
+        $now = time();
+        foreach ($states as $deviceKey => $old) {
+            $this->appendEvent([
+                'ts' => $now,
+                'date' => date('Y-m-d', $now),
+                'time' => date('H:i:s', $now),
+                'deviceKey' => (string)$deviceKey,
+                'source' => 'AUTOMATIC',
+                'reason' => $reason,
+                'previousSource' => $old['source'] ?? null
+            ]);
+        }
+        $this->WriteAttributeString('OverrideStates', '{}');
+        $this->renderStateValues();
     }
 
     public function ExpireOverrides(): void
     {
-        $now = time();
-        foreach ($this->states() as $key => $state) {
-            $expiresAt = (int)($state['expiresAt'] ?? 0);
-            if ($expiresAt > 0 && $expiresAt <= $now) {
-                $this->ClearOverride((string)$key, 'TIMEOUT');
-            }
+        $states = $this->states();
+        if ($states === []) {
+            return;
         }
-        $this->renderStates();
+
+        $now = time();
+        $changed = false;
+        foreach ($states as $deviceKey => $state) {
+            $expiresAt = (int)($state['expiresAt'] ?? 0);
+            if ($expiresAt <= 0 || $expiresAt > $now) {
+                continue;
+            }
+            unset($states[$deviceKey]);
+            $changed = true;
+            $this->appendEvent([
+                'ts' => $now,
+                'date' => date('Y-m-d', $now),
+                'time' => date('H:i:s', $now),
+                'deviceKey' => (string)$deviceKey,
+                'source' => 'AUTOMATIC',
+                'reason' => 'TIMEOUT',
+                'previousSource' => $state['source'] ?? null
+            ]);
+        }
+
+        if ($changed) {
+            $this->WriteAttributeString('OverrideStates', json_encode($states, JSON_UNESCAPED_UNICODE));
+            $this->renderStateValues();
+        }
+    }
+
+    public function SyncVisibleDeviceTree(): void
+    {
+        $this->SetTimerInterval('TreeSyncTimer', 0);
+        $root = $this->ensureCategory($this->InstanceID, 'Devices', 'Geräte', 10);
+        foreach ($this->allDevices() as $key => $device) {
+            $category = $this->ensureCategory($root, $this->deviceIdent((string)$key), (string)($device['name'] ?? $key), 0);
+            $this->ensureVariable($category, 'OperatingState', 'Betriebszustand', 3, 10);
+            $this->ensureVariable($category, 'ManualOverride', 'Manual Override', 0, 20);
+            $this->ensureVariable($category, 'Source', 'Quelle', 3, 30);
+            $this->ensureVariable($category, 'Since', 'Seit', 3, 40);
+            $this->ensureVariable($category, 'Until', 'Bis', 3, 50);
+        }
+        $this->renderStateValues();
     }
 
     public function GetDeviceStateJSON(string $deviceKey): string
     {
-        $this->ExpireOverrides();
         $device = $this->allDevices()[$deviceKey] ?? null;
         $state = $this->states()[$deviceKey] ?? null;
         return json_encode($this->deviceState($deviceKey, $device, $state), JSON_UNESCAPED_UNICODE);
@@ -252,7 +328,6 @@ class ManualOverrideManager extends IPSModule
 
     public function GetAllStatesJSON(): string
     {
-        $this->ExpireOverrides();
         return json_encode($this->allStateData(), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
     }
 
@@ -279,7 +354,7 @@ class ManualOverrideManager extends IPSModule
                 ['type' => 'ValidationTextBox', 'name' => 'SymconSourceAddress', 'caption' => 'KNX-Quelladresse von Symcon'],
                 ['type' => 'NumberSpinner', 'name' => 'DefaultOverrideMinutes', 'caption' => 'Standard Manual Override in Minuten', 'minimum' => 1, 'maximum' => 1440],
                 ['type' => 'NumberSpinner', 'name' => 'RetentionDays', 'caption' => 'Ereignisprotokoll in Tagen', 'minimum' => 1, 'maximum' => 14],
-                ['type' => 'Label', 'caption' => 'Für jedes registrierte Gerät wird unter der Instanz ein sichtbarer Betriebszustand angelegt. KNX-Taster werden über Quelladresse und Gruppenadresse erkannt; Symcon-UI-Aktionen über MOM_NotifyAction().'],
+                ['type' => 'Label', 'caption' => 'Geräte werden idempotent registriert. Der sichtbare Gerätebaum wird außerhalb der Automationsauswertung verzögert synchronisiert.'],
                 ['type' => 'List', 'name' => 'Devices', 'caption' => 'Statisch konfigurierte Geräte', 'add' => true, 'delete' => true, 'rowCount' => 8,
                     'columns' => [
                         ['name' => 'key', 'caption' => 'Schlüssel', 'width' => '150px', 'add' => '', 'edit' => ['type' => 'ValidationTextBox']],
@@ -291,6 +366,7 @@ class ManualOverrideManager extends IPSModule
                 ]
             ],
             'actions' => [
+                ['type' => 'Button', 'caption' => 'Gerätebaum synchronisieren', 'onClick' => 'MOM_SyncVisibleDeviceTree($id);'],
                 ['type' => 'Button', 'caption' => 'Debug jetzt erneuern', 'onClick' => 'MOM_RefreshDebug($id);'],
                 ['type' => 'Button', 'caption' => 'Gerätestatus anzeigen', 'onClick' => 'echo MOM_GetAllStatesJSON($id);'],
                 ['type' => 'Button', 'caption' => 'Alle Overrides auf Automatik', 'confirm' => 'Alle Manual Overrides löschen?', 'onClick' => 'MOM_ClearAllOverrides($id, "USER_CLEAR_ALL");']
@@ -315,6 +391,7 @@ class ManualOverrideManager extends IPSModule
         if ($minutes <= 0) {
             $minutes = max(1, $this->ReadPropertyInteger('DefaultOverrideMinutes'));
         }
+
         $now = time();
         $states = $this->states();
         $states[$deviceKey] = [
@@ -324,7 +401,7 @@ class ManualOverrideManager extends IPSModule
             'details' => $details
         ];
         $this->WriteAttributeString('OverrideStates', json_encode($states, JSON_UNESCAPED_UNICODE));
-        $this->renderStates();
+        $this->renderStateValues();
     }
 
     private function allDevices(): array
@@ -345,10 +422,12 @@ class ManualOverrideManager extends IPSModule
                     $decoded = json_decode($groups, true);
                     $groups = is_array($decoded) ? $decoded : [];
                 }
+                $groups = array_values(array_map('strval', is_array($groups) ? $groups : []));
+                sort($groups);
                 $result[$key] = [
                     'key' => $key,
                     'name' => (string)($row['name'] ?? $key),
-                    'groupAddresses' => is_array($groups) ? array_values($groups) : [],
+                    'groupAddresses' => $groups,
                     'actionVariableID' => (int)($row['actionVariableID'] ?? 0),
                     'overrideMinutes' => (int)($row['overrideMinutes'] ?? 0)
                 ];
@@ -372,11 +451,11 @@ class ManualOverrideManager extends IPSModule
         foreach ($this->allDevices() as $key => $device) {
             foreach (($device['groupAddresses'] ?? []) as $ga) {
                 $ga = trim((string)$ga);
-                if (!preg_match('~^\\d{1,2}/\\d{1,2}/\\d{1,3}$~', $ga)) {
+                if (preg_match('~^\d{1,2}/\d{1,2}/\d{1,3}$~', $ga) !== 1) {
                     continue;
                 }
                 $map[$ga] ??= [];
-                $map[$ga][] = $key;
+                $map[$ga][] = (string)$key;
             }
         }
         return $map;
@@ -422,7 +501,7 @@ class ManualOverrideManager extends IPSModule
             $events = array_slice($events, -10000);
         }
         $this->WriteAttributeString('EventLog', json_encode($events, JSON_UNESCAPED_UNICODE));
-        SetValueString($this->GetIDForIdent('LastEvent'), ($event['source'] ?? '?').' · '.($event['deviceKey'] ?? '?'));
+        $this->setStringIfChanged($this->GetIDForIdent('LastEvent'), ($event['source'] ?? '?').' · '.($event['deviceKey'] ?? '?'));
     }
 
     private function allStateData(): array
@@ -433,7 +512,7 @@ class ManualOverrideManager extends IPSModule
             $result[$key] = $this->deviceState((string)$key, $device, $states[$key] ?? null);
         }
         return [
-            'schema' => 'ManualOverrideManager/2',
+            'schema' => 'ManualOverrideManager/3',
             'generatedAt' => date(DATE_ATOM),
             'devices' => $result
         ];
@@ -453,25 +532,27 @@ class ManualOverrideManager extends IPSModule
         ];
     }
 
-    private function renderStates(): void
+    private function renderStateValues(): void
     {
         $data = $this->allStateData();
-        SetValueString($this->GetIDForIdent('DeviceStates'), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+        $this->setStringIfChanged($this->GetIDForIdent('DeviceStates'), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
-        $root = $this->ensureCategory($this->InstanceID, 'Devices', 'Geräte', 10);
+        $root = @IPS_GetObjectIDByIdent('Devices', $this->InstanceID);
+        if (!$root || !IPS_CategoryExists((int)$root)) {
+            return;
+        }
+
         foreach ($data['devices'] as $key => $state) {
-            $deviceCategory = $this->ensureCategory($root, $this->deviceIdent((string)$key), (string)$state['name'], 0);
-            $statusID = $this->ensureVariable($deviceCategory, 'OperatingState', 'Betriebszustand', 3, 10);
-            $overrideID = $this->ensureVariable($deviceCategory, 'ManualOverride', 'Manual Override', 0, 20);
-            $sourceID = $this->ensureVariable($deviceCategory, 'Source', 'Quelle', 3, 30);
-            $sinceID = $this->ensureVariable($deviceCategory, 'Since', 'Seit', 3, 40);
-            $untilID = $this->ensureVariable($deviceCategory, 'Until', 'Bis', 3, 50);
+            $category = @IPS_GetObjectIDByIdent($this->deviceIdent((string)$key), (int)$root);
+            if (!$category || !IPS_CategoryExists((int)$category)) {
+                continue;
+            }
 
-            SetValueString($statusID, (string)$state['status']);
-            SetValueBoolean($overrideID, (bool)$state['manualOverride']);
-            SetValueString($sourceID, (string)($state['source'] ?? ''));
-            SetValueString($sinceID, $this->formatTimestamp($state['since'] ?? null));
-            SetValueString($untilID, $this->formatTimestamp($state['expiresAt'] ?? null));
+            $this->setExistingString((int)$category, 'OperatingState', (string)$state['status']);
+            $this->setExistingBoolean((int)$category, 'ManualOverride', (bool)$state['manualOverride']);
+            $this->setExistingString((int)$category, 'Source', (string)($state['source'] ?? ''));
+            $this->setExistingString((int)$category, 'Since', $this->formatTimestamp($state['since'] ?? null));
+            $this->setExistingString((int)$category, 'Until', $this->formatTimestamp($state['expiresAt'] ?? null));
         }
     }
 
@@ -483,8 +564,9 @@ class ManualOverrideManager extends IPSModule
             IPS_SetParent($id, $parentID);
             IPS_SetIdent($id, $ident);
         }
-        IPS_SetName($id, $name);
-        IPS_SetPosition($id, $position);
+        if (IPS_GetName((int)$id) !== $name) {
+            IPS_SetName((int)$id, $name);
+        }
         return (int)$id;
     }
 
@@ -495,10 +577,33 @@ class ManualOverrideManager extends IPSModule
             $id = IPS_CreateVariable($type);
             IPS_SetParent($id, $parentID);
             IPS_SetIdent($id, $ident);
+            IPS_SetName($id, $name);
+            IPS_SetPosition($id, $position);
         }
-        IPS_SetName($id, $name);
-        IPS_SetPosition($id, $position);
         return (int)$id;
+    }
+
+    private function setExistingString(int $parentID, string $ident, string $value): void
+    {
+        $id = @IPS_GetObjectIDByIdent($ident, $parentID);
+        if ($id && IPS_VariableExists((int)$id)) {
+            $this->setStringIfChanged((int)$id, $value);
+        }
+    }
+
+    private function setExistingBoolean(int $parentID, string $ident, bool $value): void
+    {
+        $id = @IPS_GetObjectIDByIdent($ident, $parentID);
+        if ($id && IPS_VariableExists((int)$id) && (bool)GetValue((int)$id) !== $value) {
+            SetValueBoolean((int)$id, $value);
+        }
+    }
+
+    private function setStringIfChanged(int $variableID, string $value): void
+    {
+        if ($variableID > 0 && IPS_VariableExists($variableID) && (string)GetValue($variableID) !== $value) {
+            SetValueString($variableID, $value);
+        }
     }
 
     private function deviceIdent(string $deviceKey): string
@@ -555,11 +660,11 @@ class ManualOverrideManager extends IPSModule
                 return;
             }
             if (is_array($value)) {
-                foreach ($value as $key => $item) {
+                foreach ($value as $key => $child) {
                     if (is_string($key)) {
                         $parts[] = $key;
                     }
-                    $walk($item);
+                    $walk($child);
                 }
             }
         };
@@ -569,6 +674,6 @@ class ManualOverrideManager extends IPSModule
 
     private function setStatusText(string $text): void
     {
-        SetValueString($this->GetIDForIdent('Status'), $text);
+        $this->setStringIfChanged($this->GetIDForIdent('Status'), $text);
     }
 }
