@@ -1,0 +1,14 @@
+{
+    "id": "{D1E5B9B0-4D2C-4A55-94A8-0B8F6F7D219C}",
+    "name": "ManualOverrideManager",
+    "type": 3,
+    "vendor": "Smart Home",
+    "aliases": [
+        "Manual Override Manager",
+        "Manuelle Bedienung Erkennung"
+    ],
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "prefix": "MOM"
+}
